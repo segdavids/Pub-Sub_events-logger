@@ -1,0 +1,12 @@
+**/.DS_Store
+target/
+logs/
+bin/
+.idea/
+.project
+.classpath
+.factorypath
+.settings/
+.vscode/
+*.iml
+docker/state-events-logger.jar

@@ -1,0 +1,320 @@
+variables:
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}/build:${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}-${TIME_TOKEN}"
+  IMAGE_NAME_BRANCH: "${CI_REGISTRY_IMAGE}/build:${CI_COMMIT_BRANCH}-${CI_COMMIT_SHA}"
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+
+include:
+  - project: 'cim/ci-templates'
+    ref: 'main'
+    file: 
+      - maven-compile.yaml
+      - maven-validate.yaml
+      - maven-test.yaml
+      - maven-format.yaml
+      - sonarqube.yaml
+# uncomment if need to publish to dockerhub
+#      - dockerhub-build.yaml
+#      - dockerhub-publish.yaml
+      - auto-increment.yaml
+      - trivy.yaml
+      - trivy-merge.yaml
+      - grype.yaml
+      - grype-merge.yaml
+      - gitlab-publish.yaml
+      - mvn_build_tag.yaml
+      - build_time.yml
+
+stages:
+  - validate
+  - compile
+  - test
+  - code_format
+  - artifacts
+  - mvn-scan
+  - init
+  - build
+  - build-gitlab
+# uncomment if need to publish to dockerhub
+#  - build-dockerhub
+  - scan
+  - mvn_build_tag
+  - publish_gitlab
+# uncomment if need to publish to dockerhub
+#  - publish_dockerhub
+#+==================Runs on Every Commit and merge requests========================+
+maven-validate:
+  stage: validate
+
+  extends: .maven_validate
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+    - merge_requests
+  allow_failure: false
+#+==================Runs on Every Commit and merge requests========================+
+
+maven-compile:
+  extends: .maven_compile
+
+  stage: compile
+  when: on_success
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+    - merge_requests
+  allow_failure: false
+
+
+
+#+==================Runs on Every Commit and merge requests========================+
+
+maven-test:
+  stage: test
+
+  when: on_success
+  extends: .maven_test
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+    - merge_requests
+  allow_failure: false
+
+
+#+==================Runs on Every Commit and merge requests========================+
+
+maven-format:
+  stage: code_format
+
+  when: on_success
+  extends: .maven_format
+  allow_failure: false
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+    - merge_requests
+
+#+==================Runs on Every Commit only========================+
+
+mvn_artifacts:
+  stage: artifacts
+  image: maven:3.6.3
+  when: on_success
+  script:
+    - mvn clean
+    - mvn package
+    #- export TIME_TOKEN=$(env TZ=GMT-5 date +%d_%m_%Y-%H_%M_%S)
+    - mv target/${CI_PROJECT_NAME}-*.jar target/${CI_PROJECT_NAME}-"${CI_COMMIT_TIMESTAMP}".jar
+    - mv target/${CI_PROJECT_NAME}-*.jar.original target/${CI_PROJECT_NAME}-"${CI_COMMIT_TIMESTAMP}".jar.original
+
+  artifacts:
+    paths:
+      - target
+      - .ci_status/
+    expire_in: 999 yrs
+  allow_failure: false
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+
+
+
+#+==================Runs on merge requests only========================+
+
+sonarqube-check:
+  extends: .sonarqube_scan
+
+  stage: mvn-scan
+  when: on_success
+  script:
+    - mvn verify sonar:sonar -Dsonar.qualitygate.wait=true -Dsonar.projectKey=${CI_PROJECT_NAME}-CIM -Dsonar.projectName=${CI_PROJECT_NAME}-CIM
+
+#+==================Runs on merge requests only========================+
+
+##================Auto_increment_Start================
+
+time_build:
+  extends: .build_time
+  stage: init
+  when: on_success
+  only:
+    - merge_requests
+
+# ===================Auto_increment_END===================
+
+
+#+==================Runs on merge requests only========================+
+mvn_build:
+  stage: build
+  image: maven:3.6.3
+  when: on_success
+  script:
+    - export TIME_TOKEN="$(cat .ci_status/ci_time)"
+    - mvn clean
+    - mvn package
+    - mv target/${CI_PROJECT_NAME}-*.jar target/${CI_PROJECT_NAME}-"${TIME_TOKEN}".jar
+  artifacts:
+    expire_in: 999 yrs
+    paths:
+      - target
+      - .ci_status/
+  allow_failure: false
+  dependencies:
+    - time_build
+  only:
+    - merge_requests
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+
+
+#+==================Runs on every commit (manual)========================+
+gitlab_build_branch:
+  image: docker:latest
+  stage: build-gitlab
+  when: manual
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  dependencies:
+    - mvn_artifacts
+  script:
+    - export TIME_TOKEN="$(cat .ci_status/ci_time)"
+    - echo ${TIME_TOKEN} 
+    - cp -r ./target/${CI_PROJECT_NAME}-*.jar ./docker/${CI_PROJECT_NAME}.jar
+    - cd docker
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" .
+    - docker logout  $CI_REGISTRY
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" "$IMAGE_NAME_BRANCH"
+    - docker push "$IMAGE_NAME_BRANCH"
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+
+
+#+==================Runs on merge requests only========================+
+gitlab_build_merge:
+  image: docker:latest
+  stage: build-gitlab
+  #when: manual
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - apk add --update curl jq
+  dependencies:
+    - mvn_build
+    - time_build
+  variables:
+    BRANCH: MERGE_BRANCH
+    TIME_VAR: BUILD_TIME
+    TOKEN: ${CI_PIPELINE_IID_TOKEN}
+    GITLAB_URL: "https://gitlab.expertflow.com"
+
+  script:
+    - export TIME_TOKEN="$(cat .ci_status/ci_time)"
+    - echo ${TIME_TOKEN} 
+    - "curl -s -f --request PUT --header \"PRIVATE-TOKEN: ${TOKEN}\" \"${GITLAB_URL}/api/v4/projects/${CI_PROJECT_ID}/variables/${TIME_VAR}\" --form \"value=${TIME_TOKEN}\" "
+    - "curl -s -f --request PUT --header \"PRIVATE-TOKEN: ${TOKEN}\" \"${GITLAB_URL}/api/v4/projects/${CI_PROJECT_ID}/variables/${BRANCH}\" --form \"value=${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}\" "
+    - cp -r ./target/${CI_PROJECT_NAME}-"${TIME_TOKEN}".jar ./docker/${CI_PROJECT_NAME}.jar
+    - cd docker
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" .
+    - docker logout  $CI_REGISTRY
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" "${CI_REGISTRY_IMAGE}/build:${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}-${TIME_TOKEN}"
+    - docker push "${CI_REGISTRY_IMAGE}/build:${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}-${TIME_TOKEN}"
+  only:
+    - merge_requests
+  artifacts:
+    paths:
+      - .ci_status/
+
+##==================Trivy scan branch========================##
+trivy_scanning_branch:
+  extends: .trivy_scan_template
+  when: on_success
+  needs: 
+    - job: gitlab_build_branch
+  stage: scan
+  variables:
+    FULL_IMAGE_NAME: ${CI_REGISTRY_IMAGE}/build:${CI_COMMIT_BRANCH}-${CI_COMMIT_SHA}
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+
+#================================================
+
+##==================Trivy scan merge========================##
+trivy_scanning_merge:
+  when: on_success
+  stage: scan
+  extends: .trivy_scan_merge
+  needs: 
+    - job: gitlab_build_merge
+    - job: time_build
+      artifacts: true
+  only:
+    - merge_requests
+
+#================================================
+
+#+==================Runs on if docker build in branch========================+
+grype_scan_branch:
+  extends: .grype_template
+  stage: scan
+  needs:
+    - job: gitlab_build_branch
+  when: on_success
+  variables: 
+    SCAN_IMAGE: $CI_REGISTRY_IMAGE/build:$CI_COMMIT_BRANCH-$CI_COMMIT_SHA
+  only:
+    - /^.+_f-.+$/
+    - /^.+_b-.+$/
+#+==================Runs on merge requests only========================+
+grype_scan_merge:
+  stage: scan
+  extends: .grype_template_merge
+  needs:
+    - job: gitlab_build_merge
+    - job: time_build
+      artifacts: true
+  when: on_success
+  only:
+    - merge_requests
+
+
+#+==================Runs on merge requests only========================+
+mvn_build_tag:
+  stage: mvn_build_tag
+  extends: .mvn_tag
+
+  only:
+    - tags
+  
+# #+==================Runs on merge requests only========================+
+
+#+==================Runs on merge requests only========================+
+gitlab_publish:
+  stage: publish_gitlab
+  extends: .gitlab_publish
+  only:
+    - tags
+  
+# #+==================Runs on merge requests only========================+
+
+# uncomment if need to publish to dockerhub
+
+# dockerhub_publish:
+#   extends: .publish_dockerhub
+#   stage: publish_dockerhub
+#   when: on_success
+#   needs:
+#     - job: gitlab_publish
+#   only:
+#     - tags
